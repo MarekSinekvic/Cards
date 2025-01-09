@@ -1,0 +1,34 @@
+import { contextBridge, ipcRenderer } from 'electron'
+import { electronAPI } from '@electron-toolkit/preload'
+
+// Custom APIs for renderer
+const api = {
+  getCards: () => ipcRenderer.invoke('cards'),
+  getCardsRel: () => ipcRenderer.invoke('cards:relations'),
+
+  insertCard: () => ipcRenderer.invoke('cards:insert'),
+  insertCardRel: () => ipcRenderer.invoke('cards:insert:relations'),
+
+  updateCard: () => ipcRenderer.invoke('cards:update'),
+  updateCardRel: () => ipcRenderer.invoke('cards:update:relations'),
+
+  deleteCard: () => ipcRenderer.invoke('cards:delete'),
+  deleteCardRel: () => ipcRenderer.invoke('cards:delete:relations'),
+};
+
+// Use `contextBridge` APIs to expose Electron APIs to
+// renderer only if context isolation is enabled, otherwise
+// just add to the DOM global.
+if (process.contextIsolated) {
+  try {
+    contextBridge.exposeInMainWorld('electron', electronAPI)
+    contextBridge.exposeInMainWorld('api', api)
+  } catch (error) {
+    console.error(error)
+  }
+} else {
+  // @ts-ignore (define in dts)
+  window.electron = electronAPI
+  // @ts-ignore (define in dts)
+  window.api = api
+}
