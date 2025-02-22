@@ -1,33 +1,56 @@
 import { app, shell, BrowserWindow, ipcMain } from 'electron'
-import { join } from 'path'
-import { electronApp, optimizer, is } from '@electron-toolkit/utils'
+import path, { join } from 'path'
+import { electronApp, is, optimizer } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import sqlite3 from 'sqlite3';
+import fs from 'fs';
 
-const preview: sqlite3.Database = new sqlite3.Database(":memory:");
-preview.get("select s1.name,s2.name from sqlite_master as s1 join sqlite_master as s2 on s2.name='cards_rel' where s1.name='cards'", (err, row) => {
+const mainDir = app.getAppPath();
+let staticDB: sqlite3.Database;
+if (!fs.existsSync(mainDir+'/../DB.sqlite')) {
+  fs.createWriteStream(mainDir+'/../DB.sqlite',{autoClose:true}).write('');
+  staticDB = new sqlite3.Database(mainDir+'/../DB.sqlite');
+  staticDB.run("PRAGMA foreign_keys = ON");
+  staticDB.serialize(()=>{
+    staticDB.exec(`create table file_history(id integer primary key autoincrement, path text, date text default current_timestamp,
+                                            unique(path))`);
+    // staticDB.exec(`create trigger files_history_insert_limit after insert on file_history 
+    //                 begin 
+    //                   delete from file_history where id < (select max(id)-10 from file_history); 
+    //                 end`);
+    // staticDB.exec(`create table settings(id integer primary key autoincrement, key text, value text)`);
+  });
+} else
+  staticDB = new sqlite3.Database(mainDir+'/../DB.sqlite');
+
+console.log(mainDir+'/../DB.sqlite');
+
+let targetFilePath = process.argv[1];
+if (typeof targetFilePath === 'string') {
+  if (path.extname(targetFilePath) !== '.card') targetFilePath = ':memory:';
+} else targetFilePath = ':memory:'; 
+let targetFile: sqlite3.Database = new sqlite3.Database(targetFilePath);
+targetFile.run("PRAGMA foreign_keys = ON");
+targetFile.get("select s1.name,s2.name from sqlite_master as s1 join sqlite_master as s2 on s2.name='cards_rel' where s1.name='cards'", (err, row) => {
   if (err) {
     console.log(err.name+"\n"+err.message);
     return;
   }
   if (typeof row == 'undefined') {
-    preview.serialize(()=>{
-      preview.exec("create table cards(id integer primary key autoincrement, content text, posx real, posy real, color integer)");
-      preview.exec(`create table cards_rel(id integer primary key autoincrement, 
+    targetFile.serialize(()=>{
+      targetFile.exec("create table cards(id integer primary key autoincrement, content text, posx real default 0, posy real default 0, color text default '#ffffff11')");
+      targetFile.exec(`create table cards_rel(id integer primary key autoincrement, 
                                           first integer not null, 
                                           second integer not null,
-                                          foreign key(first) references cards(id),
-                                          foreign key(second) references cards(id))`);
+                                          foreign key(first) references cards(id) on delete cascade,
+                                          foreign key(second) references cards(id) on delete cascade)`);
 
-      preview.run(`insert into cards(content,posx,posy,color) values('test1',0,0,0)`);
-      preview.run(`insert into cards(content,posx,posy,color) values('test2',0,0,0)`);
-      preview.run(`insert into cards_rel(first,second) values(1,2)`);
-      // preview.get(`select * from sqlite_master where name='cards_rel'`, (err, row) => {
-      //   console.log(row); console.log(err);
-      // });
+      targetFile.run(`insert into cards(content) values('First card')`);
     });
   } else console.log("tables exist");
 });
+
+staticDB.run(`insert or replace into file_history(path) values(?)`,[targetFilePath]);
 
 let MainWindow: BrowserWindow;
 function createWindow(): void {
@@ -42,57 +65,71 @@ function createWindow(): void {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false
     }
-  })
+  });
 
   MainWindow.on('ready-to-show', () => {
     MainWindow.show();
-  })
+    MainWindow.webContents.setZoomFactor(1);
+  });
 
   MainWindow.webContents.setWindowOpenHandler((details) => {
     shell.openExternal(details.url)
     return { action: 'deny' }
   })
 
+  // MainWindow.loadFile(join(__dirname, '../renderer/index.html'))
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
     MainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
   } else {
     MainWindow.loadFile(join(__dirname, '../renderer/index.html'))
   }
-  console.log(process.argv);
 }
 
 const ipcHandlers = {
   "cards": async () => {
-    const res = await(new Promise(resolve=>{preview.all(`select content,posx,posy,color from cards`, (_,rows)=>resolve(rows));}))
-    console.log(res);
-    
+    const res = await(new Promise(resolve=>{targetFile.all(`select id,content,posx,posy,color from cards`, (_,rows)=>resolve(rows));}))
     return res;
   },
   "cards:relations": async () => {
-    const res = await(new Promise(resolve=>{preview.all(`select first,second from cards_rel`, (_,rows)=>resolve(rows));}))
+    const res = await(new Promise(resolve=>{targetFile.all(`select id,first,second from cards_rel`, (_,rows)=>resolve(rows));}))
     return res;
   },
-  "cards:insert" : async (content:string,x:number,y:number,color:number) => {
-    preview.run(`insert into cards(content,posx,posy,color) values(?,?,?,?)`, [content,x,y,color]);
+  "cards:insert" : async (_,content:string,x:number,y:number,color:number) => {
+    const res = await(new Promise(resolve=>{targetFile.get(`insert into cards(content,posx,posy,color) values(?,?,?,?) returning *`, [content,x,y,color], (_,rows)=>resolve(rows));}))
+    return res;
   },
-  "cards:relations:insert" : async (first:number,second:number) => {
-    preview.run(`insert into cards_rel(first,second) values(?,?)`, [first,second]);
+  "cards:insert:relations" : async (_,first:number,second:number) => {
+    const res = await(new Promise(resolve=>{targetFile.get(`insert into cards_rel(first,second) values(?,?) returning *`, [first,second], (_,rows)=>resolve(rows));}))    
+    return res;
   },
   
-  "cards:update" : async (vars:string[], values:string[], whereClause: string) => {
+  "cards:update" : async (_,vars:string[], values:string[], whereClause: string) => {
     const sqlSetters = vars.map((_,i)=>`${vars[i]}=${values[i]}`).join(",");
-    preview.run(`update cards set ${sqlSetters} where ${whereClause}`, values);
+    targetFile.run(`update cards set ${sqlSetters} where ${whereClause}`);
   },
-  "cards:relations:update" : async (first:number,second:number, whereClause:string) => {
-    preview.run(`update cards_rel set first=?,second=? where ${whereClause}`, [first,second]);
+  "cards:update:relations" : async (_,first:number,second:number, whereClause:string) => {
+    targetFile.run(`update cards_rel set first=?,second=? where ${whereClause}`, [first,second]);
   },
   
-  "cards:delete" : async (id:number) => {
-    preview.run(`delete from cards where id=?`,id);
+  "cards:delete" : async (_,id:number) => {
+    targetFile.run(`delete from cards where id=?`,id);
   },
-  "cards:relations:delete" : async (id: number) => {
-    preview.run(`delete from cards_rel where id=?`,id);
+  "cards:relations:delete" : async (_,id: number) => {
+    targetFile.run(`delete from cards_rel where id=?`,id);
   },
+
+  "files:history": async () => {
+    const res = await(new Promise(resolve=>{staticDB.all(`select * from file_history order by date desc limit 100`, (_,rows)=>resolve(rows));}))
+    return res;
+  },
+  "files:open": async (_,path:string): Promise<Error | null> => {
+    if (!fs.existsSync(path)) return new Error("File not found");
+    targetFilePath = path;
+    targetFile = new sqlite3.Database(targetFilePath);
+    staticDB.run(`insert or replace into file_history(path) values(?)`,[targetFilePath]);
+
+    return null
+  }
 };
 
 app.whenReady().then(() => {
@@ -110,6 +147,12 @@ app.whenReady().then(() => {
   }
 
   createWindow();
+
+  // MainWindow.webContents.send("log",mainDir+'/../DB.sqlite');
+  // staticDB.all(`select * from file_history`, (_,rows)=>{MainWindow.webContents.send("log",rows);});
+  // MainWindow.webContents.send("log",process.argv);
+  // MainWindow.webContents.send("log",targetFilePath);
+  // MainWindow.webContents.send("log",path.extname(process.argv[1]));
 
   app.on('activate', function () {
     // On macOS it's common to re-create a window in the app when the
